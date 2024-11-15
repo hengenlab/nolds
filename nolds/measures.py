@@ -8,6 +8,9 @@ from builtins import (
 import numpy as np
 import warnings
 import math
+# ckbn
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 
 
 def rowwise_chebyshev(x, y):
@@ -2026,7 +2029,7 @@ def dfa(data, nvals=None, overlap=True, order=1, fit_trend="poly",
     in this sense are smooth signals with monotonous or slowly oscillating
     behavior that are caused by external effects and not the dynamical system
     under study.
-  
+
     To get a hold of these trends, the first step is to calculate the "profile"
     of our time series as the cumulative sum of deviations from the mean,
     effectively integrating our data. This both smoothes out measurement noise
@@ -2042,7 +2045,7 @@ def dfa(data, nvals=None, overlap=True, order=1, fit_trend="poly",
     size has the form
 
     W_(n,i) = [y_i, y_(i+1), y_(i+2), ... y_(i+n-1)]
-    
+
     The local trends are then removed for each window separately by fitting a
     polynomial p_(n,i) to the window W_(n,i) and then calculating
     W'_(n,i) = W_(n,i) - p_(n,i) (element-wise subtraction).
@@ -2210,3 +2213,133 @@ def dfa(data, nvals=None, overlap=True, order=1, fit_trend="poly",
     return (poly[0], (np.log(nvals), np.log(fluctuations), poly))
   else:
     return poly[0]
+
+
+def calc_fluctuation(n, overlap, walk, order, fit_trend,
+                     total_N):
+    # if overlap:
+    #     d = \
+    #       np.array([walk[i:i + n] for i in range(0, len(walk) - n, n // 2)])
+    # else:
+    #     d = walk[:total_N - (total_N % n)].reshape((total_N // n, n))
+
+    # x = np.arange(n)
+    # tpoly = [poly_fit(x, d[i], order, fit=fit_trend) for i in range(len(d))]
+    # trend = np.array([np.polyval(tpoly[i], x) for i in range(len(d))])
+    # flucs = np.sqrt(np.sum((d - trend) ** 2, axis=1) / n)
+    # return np.sum(flucs) / len(flucs)
+
+    if overlap:
+        # step size n/2 instead of n
+        d = np.array([walk[i:i + n] for i in range(0, len(walk) - n, n // 2)])
+    else:
+        # non-overlapping windows => we can simply do a reshape
+        d = walk[:total_N - (total_N % n)]
+        d = d.reshape((total_N // n, n))
+    # calculate local trends as polynomes
+    x = np.arange(n)
+    tpoly = [poly_fit(x, d[i], order, fit=fit_trend)
+             for i in range(len(d))]
+    tpoly = np.array(tpoly)
+    trend = np.array([np.polyval(tpoly[i], x) for i in range(len(d))])
+    # calculate mean-square differences for each walk in d around trend
+    flucs = np.sum((d - trend) ** 2, axis=1) / n
+    # take another mean across all walks and
+    # finally take the square root of that
+    # NOTE: To map this to the formula in Peng1995,
+    # observe that this simplifies
+    # to np.sqrt(np.sum((d - trend) ** 2) / total_N)
+    # if we have non-overlapping
+    # windows and the last window matches the end of the data perfectly.
+    return np.sqrt(np.sum(flucs) / len(flucs))
+
+
+def dfam(data, nvals=None, overlap=True, order=1, fit_trend="poly",
+         fit_exp="RANSAC", debug_plot=False, debug_data=False, plot_file=None,
+         num_cpus=1):
+    """
+    Performs a detrended fluctuation analysis (DFA) on the given data.
+
+    Args:
+        data (array-like of float): Time series.
+    Kwargs:
+        nvals (iterable of int): Subseries sizes at which to
+            calculate fluctuation.
+        overlap (boolean): Use overlapping windows if True.
+        order (int): Polynomial order of trend to remove.
+        fit_trend (str): Method for fitting trends ('poly' or 'RANSAC').
+        fit_exp (str): Method for line fit ('poly' or 'RANSAC').
+        debug_plot (boolean): Plot final line-fitting if True.
+        debug_data (boolean): Return debugging data if True.
+        plot_file (str): Save plot to file if debug_plot is True.
+        num_cpus (int): Number of cpus to use, default 1
+
+    Returns:
+        float: Estimate alpha for the Hurst parameter.
+        Optional: Debug data if debug_data is True.
+    """
+    data = np.asarray(data)
+    total_N = len(data)
+
+    if nvals is None:
+        if total_N > 70:
+            nvals = logarithmic_n(4, 0.1 * total_N, 1.2)
+        elif total_N > 10:
+            nvals = [4, 5, 6, 7, 8, 9]
+        else:
+            nvals = [total_N-2, total_N-1]
+            msg = "Choosing nvals = {}, DFA with less than ten data points " +\
+                "is extremely unreliable"
+            warnings.warn(msg.format(nvals), RuntimeWarning)
+
+    if len(nvals) < 2:
+        raise ValueError("At least two nvals are needed")
+    if np.min(nvals) < 2:
+        raise ValueError("nvals must be at least two")
+    if np.max(nvals) >= total_N:
+        raise ValueError("nvals cannot be larger than the input size")
+
+    walk = np.cumsum(data - np.mean(data))
+
+    # def calc_fluctuation(n):
+    #     if overlap:
+    #         d = np.array([walk[i:i + n] for i
+    #                       in range(0, len(walk) - n, n // 2)])
+    #     else:
+    #         d = walk[:total_N - (total_N % n)].reshape((total_N // n, n))
+
+    #     x = np.arange(n)
+    #     tpoly = [poly_fit(x, d[i], order,
+    #              fit=fit_trend) for i in range(len(d))]
+    #     trend = np.array([np.polyval(tpoly[i], x) for i in range(len(d))])
+    #     flucs = np.sqrt(np.sum((d - trend) ** 2, axis=1) / n)
+    #     return np.sum(flucs) / len(flucs)
+
+    # with ProcessPoolExecutor() as executor:
+    #     fluctuations = list(executor.map(calc_fluctuation, nvals))
+
+    with ProcessPoolExecutor(max_workers=num_cpus) as executor:
+        func = partial(calc_fluctuation, overlap=overlap,
+                       walk=walk, order=order,
+                       fit_trend=fit_trend,
+                       total_N=total_N)
+        fluctuations = list(executor.map(func, nvals))
+
+    fluctuations = np.array(fluctuations)
+    nonzero = np.where(fluctuations != 0)
+    nvals = np.array(nvals)[nonzero]
+    fluctuations = fluctuations[nonzero]
+
+    if len(fluctuations) == 0:
+        poly = [np.nan, np.nan]
+    else:
+        poly = poly_fit(np.log(nvals), np.log(fluctuations), 1, fit=fit_exp)
+
+    if debug_plot:
+        plot_reg(np.log(nvals), np.log(fluctuations),
+                 poly, "log(n)", "std(X,n)", fname=plot_file)
+
+    if debug_data:
+        return poly[0], (np.log(nvals), np.log(fluctuations), poly)
+    else:
+        return poly[0]
